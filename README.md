@@ -78,7 +78,7 @@ Full request paths and auth planes: [docs/ARCHITECTURE_DIAGRAM.md](docs/ARCHITEC
 
 ```bash
 # clone the repo
-git clone https://github.com/YOUR_GITHUB_USERNAME/cyvex.git
+git clone https://github.com/S1lent0x1njd/cyvex.git
 cd cyvex
 
 # set up .env next to docker-compose.yml (untracked - .gitignore covers it):
@@ -180,7 +180,7 @@ cyvex report --nca out.pdf        # NCA ECC-2:2024 compliance PDF
 ```bash
 cyvex server install                  # prompt for a path/URL to docker-compose.yml
 cyvex server install ./docker-compose.yml   # verify a local file
-cyvex server install https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/cyvex/main/docker-compose.yml
+cyvex server install https://raw.githubusercontent.com/S1lent0x1njd/cyvex/main/docker-compose.yml
 cyvex server start                    # docker compose up -d, print the URLs
 cyvex server stop                     # docker compose down (volumes kept)
 cyvex server update                   # pull + up -d
