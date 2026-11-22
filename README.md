@@ -68,7 +68,7 @@ features ──► EvidenceGatherer ──► 15 rule hits + benign flags
                                                  | FALSE_POSITIVE | INSUFFICIENT_EVIDENCE
 ```
 
-Full request paths and auth planes: [main/ARCHITECTURE_DIAGRAM.md](main/ARCHITECTURE_DIAGRAM.md).
+Full request paths and auth planes: [Cyvex/ARCHITECTURE_DIAGRAM.md](Cyvex/ARCHITECTURE_DIAGRAM.md).
 
 ---
 
