@@ -1,0 +1,262 @@
+# ============================================================================
+# Cyvex enterprise stack
+#
+#   api     - FastAPI on :8000 (multi-worker uvicorn, HMAC trust anchors)
+#   gui     - Streamlit dashboard on :8501 (probes http://api:8000)
+#   redis   - broker + result backend, INTERNAL ONLY (no host port mapping)
+#   worker  - celery prefork pool + embedded beat: hourly scrape/predict/
+#             verify cycle, Slack dispatch on HIGH_CONFIDENCE
+#   postgres - PostgreSQL 16: organizations / users / api_keys / alerts
+#
+# Secrets are never written in this file. Every sensitive value is variable
+# interpolation from the shell or an untracked `.env` next to this file:
+#
+#   CYVEX_SIGNING_SECRET   >=16 chars, HMAC key for the API
+#   CYVEX_JWT_SECRET       >=32 chars, JWT session signing (Phase 7)
+#   CYVEX_DATABASE_URL     postgresql+psycopg2://cyvex:cyvex@postgres:5432/cyvex
+#   GITHUB_TOKEN            raises scrape rate limits
+#   CYVEX_SLACK_WEBHOOK_URL  https://hooks.slab... incoming webhook
+#   CYVEX_WATCHED_REPOS    comma list, default pallets/flask
+#   STRIPE_SECRET_KEY       sk_test_/sk_live_ - Checkout session creation
+#   STRIPE_WEBHOOK_SECRET   whsec_ - webhook signature verification
+#
+#   docker compose up --build -d
+#   docker compose exec api python -c "from src.api.database import init_db; init_db()"
+#   docker compose ps && docker compose logs -f worker
+# ============================================================================
+name: cyvex
+
+x-cyvex-env: &cyvex-env
+  TZ: UTC
+  CYVEX_LOG_LEVEL: ${CYVEX_LOG_LEVEL:-INFO}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  NVD_API_KEY: ${NVD_API_KEY:-}
+  CYVEX_SIGNING_SECRET: ${CYVEX_SIGNING_SECRET:-}
+  CYVEX_JWT_SECRET: ${CYVEX_JWT_SECRET:-}
+  CYVEX_JWT_TTL_MINUTES: ${CYVEX_JWT_TTL_MINUTES:-60}
+  CYVEX_DATABASE_URL: ${CYVEX_DATABASE_URL:-postgresql+psycopg2://cyvex:cyvex@postgres:5432/cyvex}
+  CYVEX_SLACK_WEBHOOK_URL: ${CYVEX_SLACK_WEBHOOK_URL:-}
+  CYVEX_WATCHED_REPOS: ${CYVEX_WATCHED_REPOS:-pallets/flask}
+  # Phase 19 alert dispatcher: email channel for HIGH_CONFIDENCE alerts.
+  # Unset CYVEX_SMTP_HOST -> email disabled (Slack-only), never an error.
+  CYVEX_SMTP_HOST: ${CYVEX_SMTP_HOST:-}
+  CYVEX_SMTP_PORT: ${CYVEX_SMTP_PORT:-587}
+  CYVEX_SMTP_USER: ${CYVEX_SMTP_USER:-}
+  CYVEX_SMTP_PASSWORD: ${CYVEX_SMTP_PASSWORD:-}
+  CYVEX_SMTP_FROM: ${CYVEX_SMTP_FROM:-}
+  CYVEX_SMTP_TO: ${CYVEX_SMTP_TO:-}
+  CYVEX_SMTP_STARTTLS: ${CYVEX_SMTP_STARTTLS:-true}
+  CYVEX_SMTP_ENABLED: ${CYVEX_SMTP_ENABLED:-true}
+  CYVEX_REDIS_URL: ${CYVEX_REDIS_URL:-redis://:${REDIS_PASSWORD:-cyvex}@redis:6379/0}
+  # Phase 13 billing: server-side Stripe keys (never NEXT_PUBLIC_*).
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:3000/dashboard/billing?status=success}
+  STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:3000/dashboard/billing?status=cancel}
+  # Phase 15 AI Copilot: Gemini key for src/verification/ai_explainer.py.
+  # Empty -> ai_explanation returns its fallback string, never fails a scan.
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  # Phase 33: automated weekly retrain (celery beat, Sunday 00:00 UTC).
+  # Candidate trains to the staging bundle and only os.replace()s over the
+  # live one when aggregate ROC AUC clears the gate. MOCK_FETCH=1 keeps the
+  # OSV/NVD pull offline (set 0 to hit the real feeds).
+  CYVEX_MODEL_PATH: ${CYVEX_MODEL_PATH:-models/cyvex_model.pkl}
+  CYVEX_RETRAIN_STAGING_PATH: ${CYVEX_RETRAIN_STAGING_PATH:-models/cyvex_model_new.pkl}
+  CYVEX_TRAINING_CORPUS: ${CYVEX_TRAINING_CORPUS:-data/training/real_corpus.jsonl}
+  CYVEX_RETRAIN_MIN_AUC: ${CYVEX_RETRAIN_MIN_AUC:-0.80}
+  CYVEX_RETRAIN_AGE_DAYS: ${CYVEX_RETRAIN_AGE_DAYS:-30}
+  CYVEX_RETRAIN_MOCK_FETCH: ${CYVEX_RETRAIN_MOCK_FETCH:-1}
+
+x-cyvex-common: &cyvex-common
+  # Build straight from this repository (production: image + compose live in
+  # the same checkout, `docker compose up -d --build` is the install path).
+  # Replace with image: cyvex/api:latest once published to Docker Hub
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: cyvex:${CYVEX_TAG:-latest}
+  init: true                       # PID 1 = tini: zombie reaping for prefork
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true       # block setuid escalation inside containers
+  cap_drop:
+    - ALL                          # drop every Linux capability: none needed
+  environment: *cyvex-env
+  volumes:
+    - cyvex-raw:/app/data/raw         # scraped commit chunks (shared)
+    - cyvex-features:/app/data/features
+    - cyvex-worker:/app/data/worker   # scan state: processed/alerted SHAs
+    - cyvex-logs:/app/logs            # rotating audit trail (shared)
+    # Phase 33: the weekly retrain os.replace()s the bundle in place, so the
+    # model and the refreshed corpus must outlive a container rebuild. Docker
+    # seeds a fresh named volume from the image on first mount, so the baked
+    # models/cyvex_model.pkl is still there on day one.
+    - cyvex-models:/app/models
+    - cyvex-training:/app/data/training
+
+services:
+  # ----------------------------------------------------------- postgres ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: cyvex-postgres
+    hostname: cyvex-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cyvex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cyvex}
+      POSTGRES_DB: cyvex
+    volumes:
+      - cyvex-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyvex -d cyvex"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # No `ports:` mapping on purpose - the database is reachable ONLY from
+    # the compose-internal network (api + worker). Credentials never leave
+    # this file's variable interpolation either.
+    security_opt:
+      - no-new-privileges:true
+
+  # ------------------------------------------------------------------ api ---
+  api:
+    <<: *cyvex-common
+    container_name: cyvex-api
+    hostname: cyvex-api
+    # Default role of the image; UVICORN_WORKERS scales process count.
+    command:
+      - python
+      - -m
+      - uvicorn
+      - src.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - ${UVICORN_WORKERS:-4}
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+    ports:
+      - "${CYVEX_API_PORT:-8000}:8000"   # terminate TLS at your reverse proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Phase 36: WS tickets and SAML bindings live in Redis
+      # (routes.SecretStore) and the api runs N uvicorn workers - the
+      # in-memory fallback is per-worker, so a ticket minted in one
+      # worker would be unconsumable in another. Order redis healthy
+      # first: SecretStore only probes the broker on first use.
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 45s
+      retries: 3
+
+  # ------------------------------------------------------------------ gui ---
+  gui:
+    <<: *cyvex-common
+    container_name: cyvex-gui
+    hostname: cyvex-gui
+    command:
+      - streamlit
+      - run
+      - gui/app.py
+      - --server.port
+      - "8501"
+      - --server.address
+      - 0.0.0.0
+      - --server.headless
+      - "true"
+      - --browser.gatherUsageStats
+      - "false"
+    environment:
+      <<: *cyvex-env
+      CYVEX_API_URL: http://api:8000      # compose-internal service DNS
+    ports:
+      - "${CYVEX_GUI_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 45s
+      retries: 3
+
+  # ---------------------------------------------------------------- redis ---
+  redis:
+    image: redis:alpine
+    container_name: cyvex-redis
+    hostname: cyvex-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Task payloads and secrets never leave this container - no host port.
+    # Phase 40 (AuditB P1): REQUIREPASS + bind all container interfaces so
+    # an unauthenticated client on the compose network gets NOAUTH instead
+    # of a wide-open broker; no `ports:` mapping below, so the password is
+    # defense in depth - nothing on the host can reach 6379 at all.
+    # REDIS_PASSWORD is interpolated by compose (same value everywhere);
+    # default "cyvex" matches the internal-only dev stack.
+    command: redis-server --requirepass ${REDIS_PASSWORD:-cyvex} --bind 0.0.0.0
+    volumes:
+      - cyvex-redis:/data
+    healthcheck:
+      # Authenticated probe: a bare `redis-cli ping` answers NOAUTH (and
+      # redis-cli still exits 0), which would report a broken broker as
+      # healthy. -a + grep PONG makes the check fail when auth fails.
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-cyvex} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- worker ---
+  worker:
+    <<: *cyvex-common
+    container_name: cyvex-worker
+    hostname: cyvex-worker             # stable node name: celery@cyvex-worker
+    # Celery worker with EMBEDDED beat: beat publishes the hourly schedule to
+    # redis, the same process's pool consumes it. Split `beat` into its own
+    # service (command: celery -A src.worker.tasks beat) before scaling the
+    # worker replica count >1, otherwise duplicate timers fire per replica.
+    command:
+      - celery
+      - -A
+      - src.worker.tasks
+      - worker
+      - --loglevel
+      - ${CELERY_LOG_LEVEL:-info}
+      - --concurrency
+      - ${CELERY_CONCURRENCY:-2}       # prefork children = parallel scan cycles
+      - --max-tasks-per-child
+      - ${CELERY_MAX_TASKS_PER_CHILD:-50}
+      - --beat
+      - --schedule
+      - /app/data/worker/beat-schedule
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A src.worker.tasks inspect ping -d celery@cyvex-worker --timeout 10 || exit 1"]
+      interval: 60s
+      timeout: 15s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  cyvex-raw:
+  cyvex-features:
+  cyvex-worker:
+  cyvex-logs:
+  cyvex-redis:
+  cyvex-pgdata:
+  cyvex-models:
+  cyvex-training:
